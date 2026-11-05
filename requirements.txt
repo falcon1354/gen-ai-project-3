@@ -1,0 +1,10 @@
+torch>=2.1.0
+transformers>=4.44.0
+datasets>=2.20.0
+accelerate>=0.33.0
+rouge-score>=0.1.2
+numpy>=1.24.0
+matplotlib>=3.8.0
+gradio>=4.0.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0

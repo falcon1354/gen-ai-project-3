@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+wandb/
+.DS_Store
+Thumbs.db
+results/*.png
+results/eval_summaries.jsonl
+results/*_log.json
+results/table*.json
+results/sft_samples_*.json
+# keep templates / markdown analysis tracked
+!results/analysis.md
+!results/human_eval.csv
+!results/samples.md
+!results/.gitkeep
