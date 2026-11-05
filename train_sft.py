@@ -11,7 +11,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
 from common import (
     decode_summary,
@@ -19,6 +18,7 @@ from common import (
     get_device,
     masked_mean,
     set_seed,
+    slice_batch,
     token_logprobs,
 )
 from starter.batching import collate_prompts, collate_sft
@@ -36,29 +36,42 @@ def sft_loss(model, batch):
 
 
 @torch.no_grad()
-def eval_loss(model, loader, device):
+def eval_loss(model, loader, device, micro_batch_size: int):
     model.eval()
-    total, n = 0.0, 0
+    total_loss = 0.0
+    total_tokens = 0
     for batch in loader:
         batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-        loss = sft_loss(model, batch)
-        total += loss.item()
-        n += 1
+        B = batch["input_ids"].shape[0]
+        for start in range(0, B, micro_batch_size):
+            mb = slice_batch(batch, start, start + micro_batch_size)
+            token_lp, summary_mask = token_logprobs(
+                model, mb["input_ids"], mb["attention_mask"], mb["prompt_lens"]
+            )
+            # accumulate token-weighted loss so micro-batching matches full-batch mean
+            n = summary_mask.sum().item()
+            if n == 0:
+                continue
+            total_loss += (-token_lp[summary_mask.bool()]).sum().item()
+            total_tokens += n
     model.train()
-    return total / max(n, 1)
+    return total_loss / max(total_tokens, 1)
 
 
 def verify_summary_mask(model, tokenizer, batch, device):
     """Correctness check: decoding mask==1 tokens == summary + EOS."""
-    batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+    # only need one row for the check
+    batch = slice_batch(
+        {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()},
+        0,
+        1,
+    )
     _, summary_mask = token_logprobs(
         model, batch["input_ids"], batch["attention_mask"], batch["prompt_lens"]
     )
-    # mask is (B, L-1) aligned with tokens at positions 1..L-1
     ids = batch["input_ids"]
     print("\n=== SFT mask check (first example) ===")
     mask0 = summary_mask[0].bool()
-    # tokens corresponding to mask positions: ids[0, 1:]
     selected = ids[0, 1:][mask0]
     decoded = tokenizer.decode(selected)
     print("Decoded where mask==1:", repr(decoded))
@@ -69,30 +82,32 @@ def verify_summary_mask(model, tokenizer, batch, device):
 def sample_eval_summaries(model, tokenizer, eval_posts, device, n=5):
     model.eval()
     subset = eval_posts[:n]
-    loader = DataLoader(
-        subset,
-        batch_size=n,
-        collate_fn=partial(collate_prompts, pad_id=tokenizer.pad_token_id),
-    )
-    batch = next(iter(loader))
-    input_ids = batch["input_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
-    sequences, prompt_len, gen_mask = generate_summaries(
-        model,
-        tokenizer,
-        input_ids,
-        attention_mask,
-        max_new_tokens=MAX_SUMMARY_TOKENS,
-        do_sample=False,
-    )
-    texts = decode_summary(tokenizer, sequences, prompt_len, gen_mask)
     rows = []
-    for i, t in enumerate(texts):
+    # generate one-at-a-time to avoid OOM on long prompts
+    for i in range(n):
+        item = subset[i]
+        loader = DataLoader(
+            [item],
+            batch_size=1,
+            collate_fn=partial(collate_prompts, pad_id=tokenizer.pad_token_id),
+        )
+        batch = next(iter(loader))
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        sequences, prompt_len, gen_mask = generate_summaries(
+            model,
+            tokenizer,
+            input_ids,
+            attention_mask,
+            max_new_tokens=MAX_SUMMARY_TOKENS,
+            do_sample=False,
+        )
+        text = decode_summary(tokenizer, sequences, prompt_len, gen_mask)[0]
         rows.append(
             {
-                "prompt": subset[i]["prompt"],
-                "reference": subset[i]["summary"],
-                "generated": t,
+                "prompt": item["prompt"],
+                "reference": item["summary"],
+                "generated": text,
             }
         )
     return rows
@@ -106,11 +121,20 @@ def train(args):
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
 
+    # keep assignment batch size 16 via grad accumulation if needed
+    assert args.batch_size % args.micro_batch_size == 0, (
+        "batch_size must be divisible by micro_batch_size"
+    )
+    accum_steps = args.batch_size // args.micro_batch_size
+    print(
+        f"Effective batch={args.batch_size} "
+        f"(micro_batch={args.micro_batch_size} × accum={accum_steps})"
+    )
+
     tokenizer = load_tokenizer()
     print("Loading SFT data…")
     sft_train, sft_val = load_sft_splits(tokenizer)
 
-    # Task 1.2 stats
     prompt_lens = [len(x["prompt_ids"]) for x in sft_train]
     summary_lens = [len(x["summary_ids"]) for x in sft_train]
     data_stats = {
@@ -141,19 +165,29 @@ def train(args):
 
     print(f"Loading base model {MODEL_NAME}…")
     model = load_causal_lm(MODEL_NAME, device=device)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
     model.train()
 
-    # mask check on one batch
     check_batch = next(iter(train_loader))
     verify_summary_mask(model, tokenizer, check_batch, device)
+    del check_batch
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    # before-SFT samples
     eval_posts = load_eval_posts(tokenizer)
     before = sample_eval_summaries(model, tokenizer, eval_posts, device, n=5)
     with open(results_dir / "sft_samples_before.json", "w", encoding="utf-8") as f:
         json.dump(before, f, indent=2, ensure_ascii=False)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
+    # AdamW in fp32 master params is safer; model weights may be fp16
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     log = {"step": [], "train_loss": [], "val_loss": []}
     step = 0
@@ -167,26 +201,37 @@ def train(args):
                 k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()
             }
             optimizer.zero_grad(set_to_none=True)
-            loss = sft_loss(model, batch)
-            loss.backward()
+            B = batch["input_ids"].shape[0]
+            loss_accum = 0.0
+
+            for start in range(0, B, args.micro_batch_size):
+                mb = slice_batch(batch, start, start + args.micro_batch_size)
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
+                    loss = sft_loss(model, mb) / accum_steps
+                scaler.scale(loss).backward()
+                loss_accum += loss.item() * accum_steps
+
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             step += 1
-            running += loss.item()
+            running += loss_accum
             running_n += 1
 
             if step % args.log_every == 0:
                 train_l = running / running_n
-                val_l = eval_loss(model, val_loader, device)
+                val_l = eval_loss(model, val_loader, device, args.micro_batch_size)
                 print(f"step {step}: train_loss={train_l:.4f} val_loss={val_l:.4f}")
                 log["step"].append(step)
                 log["train_loss"].append(train_l)
                 log["val_loss"].append(val_l)
                 running, running_n = 0.0, 0
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
-    # final val
-    final_val = eval_loss(model, val_loader, device)
+    final_val = eval_loss(model, val_loader, device, args.micro_batch_size)
     elapsed = time.time() - t0
     print(f"SFT done. final val_loss={final_val:.4f} time={elapsed/60:.1f} min")
 
@@ -218,7 +263,13 @@ def train(args):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--out_dir", default="checkpoints/sft")
-    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--batch_size", type=int, default=16, help="Effective batch (assignment)")
+    p.add_argument(
+        "--micro_batch_size",
+        type=int,
+        default=2,
+        help="Per-forward batch to fit T4; grads accumulate to --batch_size",
+    )
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--log_every", type=int, default=250)

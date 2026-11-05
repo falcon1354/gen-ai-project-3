@@ -28,6 +28,24 @@ def summary_token_mask(
     return (is_summary & is_real).long()
 
 
+def logits_to_token_logprobs(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    """Memory-friendly log π(x_t | x_<t) for t >= 1, shape (B, L-1).
+
+    Uses cross-entropy instead of materializing a full (B, L, V) log-softmax,
+    which OOMs on T4 with long Reddit prompts + large SmolLM vocab.
+    """
+    # logits[:, t] predicts input_ids[:, t+1]
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    B, T, V = shift_logits.shape
+    nll = F.cross_entropy(
+        shift_logits.reshape(-1, V),
+        shift_labels.reshape(-1),
+        reduction="none",
+    ).view(B, T)
+    return -nll
+
+
 def token_logprobs(
     model,
     input_ids: torch.Tensor,
@@ -41,16 +59,24 @@ def token_logprobs(
     prompt_lens for a useful mask).
     """
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = outputs.logits  # (B, L, V)
-    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-    targets = input_ids[:, 1:].unsqueeze(-1)
-    token_lp = log_probs.gather(-1, targets).squeeze(-1)  # (B, L-1)
+    token_lp = logits_to_token_logprobs(outputs.logits, input_ids)
 
     if prompt_lens is None:
         summary_mask = torch.zeros_like(token_lp, dtype=torch.long)
     else:
         summary_mask = summary_token_mask(input_ids, attention_mask, prompt_lens)
     return token_lp, summary_mask
+
+
+def slice_batch(batch: dict, start: int, end: int) -> dict:
+    """Slice a collated batch along the batch dimension."""
+    out = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            out[k] = v[start:end]
+        else:
+            out[k] = v
+    return out
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

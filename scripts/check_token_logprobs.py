@@ -1,6 +1,13 @@
 """Task 1.3 – verify token_logprobs + summary mask on one SFT batch."""
 
+import sys
 from functools import partial
+from pathlib import Path
+
+# repo root must be on sys.path when launched as scripts/...
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import torch
 from torch.utils.data import DataLoader

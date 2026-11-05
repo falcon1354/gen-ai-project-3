@@ -19,9 +19,9 @@ from common import (
     freeze_model,
     generate_summaries,
     get_device,
+    logits_to_token_logprobs,
     masked_mean,
     set_seed,
-    token_logprobs,
 )
 from starter.batching import collate_prompts
 from starter.config import MAX_SUMMARY_TOKENS, SEED
@@ -61,21 +61,23 @@ class PolicyWithValue(nn.Module):
 
 def logprobs_from_logits(logits, input_ids):
     """Token log-probs for positions 1..L-1 from logits at 0..L-2. (B, L-1)"""
-    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-    targets = input_ids[:, 1:].unsqueeze(-1)
-    return log_probs.gather(-1, targets).squeeze(-1)
+    return logits_to_token_logprobs(logits, input_ids)
 
 
 def entropy_from_logits(logits, response_mask):
     """Mean entropy of π(·|s_t) over generated (non-pad) tokens.
-    logits aligned so logits[:, t] predicts token t+1; we use logits at
-    positions that predict generated tokens (= response_mask positions).
+
+    Computed only on masked response positions to avoid a full-batch
+    (B, L, V) softmax on T4.
     """
-    # logits for predicting tokens at indices 1..L-1: shape (B, L-1, V)
-    lp = F.log_softmax(logits[:, :-1, :], dim=-1)
-    probs = lp.exp()
-    ent = -(probs * lp).sum(dim=-1)  # (B, L-1)
-    return masked_mean(ent, response_mask)
+    shift = logits[:, :-1, :]  # (B, L-1, V)
+    # flatten masked positions
+    flat = shift[response_mask.bool()]  # (N, V)
+    if flat.numel() == 0:
+        return shift.new_zeros(())
+    lp = F.log_softmax(flat.float(), dim=-1)
+    ent = -(lp.exp() * lp).sum(dim=-1)
+    return ent.mean()
 
 
 @torch.no_grad()
