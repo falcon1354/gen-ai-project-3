@@ -209,7 +209,7 @@ def train(args):
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
                     loss = sft_loss(model, mb) / accum_steps
                 scaler.scale(loss).backward()
-                loss_accum += loss.item() * accum_steps
+                loss_accum += float(loss.detach()) * accum_steps
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
