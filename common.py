@@ -18,9 +18,7 @@ def summary_token_mask(
     """
     B, L = input_ids.shape
     device = input_ids.device
-    # positions 0..L-2 in the mask align with tokens at indices 1..L-1
     positions = torch.arange(L - 1, device=device).unsqueeze(0).expand(B, -1)
-    # token index being predicted
     token_idx = positions + 1
     pl = prompt_lens.to(device).unsqueeze(1)
     is_summary = token_idx >= pl
@@ -31,19 +29,19 @@ def summary_token_mask(
 def logits_to_token_logprobs(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
     """Memory-friendly log π(x_t | x_<t) for t >= 1, shape (B, L-1).
 
-    Uses cross-entropy instead of materializing a full (B, L, V) log-softmax,
-    which OOMs on T4 with long Reddit prompts + large SmolLM vocab.
+    Processes one sequence at a time so we never allocate a giant
+    (B·T, V) cross-entropy workspace on a free T4.
     """
-    # logits[:, t] predicts input_ids[:, t+1]
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
-    B, T, V = shift_logits.shape
-    nll = F.cross_entropy(
-        shift_logits.reshape(-1, V),
-        shift_labels.reshape(-1),
-        reduction="none",
-    ).view(B, T)
-    return -nll
+    shift_logits = logits[:, :-1, :]
+    shift_labels = input_ids[:, 1:]
+    B = shift_logits.shape[0]
+    rows = []
+    for i in range(B):
+        # (T, V) -> logprob of the taken token at each step
+        logp = F.log_softmax(shift_logits[i].float(), dim=-1)
+        rows.append(logp.gather(-1, shift_labels[i].unsqueeze(-1)).squeeze(-1))
+        del logp
+    return torch.stack(rows, dim=0)
 
 
 def token_logprobs(
@@ -60,6 +58,7 @@ def token_logprobs(
     """
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     token_lp = logits_to_token_logprobs(outputs.logits, input_ids)
+    del outputs
 
     if prompt_lens is None:
         summary_mask = torch.zeros_like(token_lp, dtype=torch.long)
@@ -128,14 +127,11 @@ def generate_summaries(
     if do_sample:
         gen_kwargs["temperature"] = temperature
         gen_kwargs["top_p"] = top_p
-        # top_k=0 means disabled in the assignment; omit the arg
         if top_k and top_k > 0:
             gen_kwargs["top_k"] = top_k
 
     sequences = model.generate(**gen_kwargs)
     prompt_len = input_ids.shape[1]
-    # Build attention mask for the full sequence: original mask + 1s for new tokens,
-    # but zero out everything after the first EOS in the generated part.
     B, full_L = sequences.shape
     device = sequences.device
     new_mask = torch.ones(B, full_L, dtype=torch.long, device=device)
@@ -145,13 +141,60 @@ def generate_summaries(
         gen = sequences[i, prompt_len:]
         eos_pos = (gen == eos_id).nonzero(as_tuple=False)
         if len(eos_pos) > 0:
-            # keep EOS itself; zero everything after it
             cut = prompt_len + int(eos_pos[0].item()) + 1
             if cut < full_L:
                 new_mask[i, cut:] = 0
-                # also zero the ids after EOS for cleanliness (optional)
                 sequences[i, cut:] = tokenizer.pad_token_id
     return sequences, prompt_len, new_mask
+
+
+@torch.no_grad()
+def generate_summaries_chunked(
+    model,
+    tokenizer,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_new_tokens: int = 48,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    chunk_size: int = 4,
+):
+    """Like generate_summaries but generates in small chunks for T4 memory."""
+    B = input_ids.shape[0]
+    seqs, masks = [], []
+    prompt_len = None
+    for start in range(0, B, chunk_size):
+        end = min(start + chunk_size, B)
+        s, pl, m = generate_summaries(
+            model,
+            tokenizer,
+            input_ids[start:end],
+            attention_mask[start:end],
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+        prompt_len = pl
+        seqs.append(s)
+        masks.append(m)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    # pad to common length across chunks (generate can vary slightly)
+    max_L = max(s.shape[1] for s in seqs)
+    pad_id = tokenizer.pad_token_id
+    out_seqs, out_masks = [], []
+    for s, m in zip(seqs, masks):
+        if s.shape[1] < max_L:
+            pad = max_L - s.shape[1]
+            s = F.pad(s, (0, pad), value=pad_id)
+            m = F.pad(m, (0, pad), value=0)
+        out_seqs.append(s)
+        out_masks.append(m)
+    return torch.cat(out_seqs, 0), prompt_len, torch.cat(out_masks, 0)
 
 
 def decode_summary(tokenizer, sequences, prompt_len, attention_mask=None):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from functools import partial
 from pathlib import Path
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader, RandomSampler
 
 from common import (
     freeze_model,
-    generate_summaries,
+    generate_summaries_chunked,
     get_device,
     logits_to_token_logprobs,
     masked_mean,
@@ -28,6 +29,9 @@ from starter.config import MAX_SUMMARY_TOKENS, SEED
 from starter.data import load_sft_splits
 from starter.models import load_causal_lm, load_tokenizer
 from train_reward import RewardModel
+
+# reduce CUDA allocator fragmentation on free T4
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 class PolicyWithValue(nn.Module):
@@ -42,14 +46,11 @@ class PolicyWithValue(nn.Module):
         self.to(device)
 
     def forward(self, input_ids, attention_mask):
-        out = self.lm(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        logits = out.logits
-        hidden = out.hidden_states[-1]
+        # only last hidden state — avoid keeping every layer's activations
+        out = self.lm.model(input_ids=input_ids, attention_mask=attention_mask)
+        hidden = out.last_hidden_state
         values = self.value_head(hidden).squeeze(-1)  # (B, L)
+        logits = self.lm.lm_head(hidden)
         return logits, values
 
     def save_policy(self, path: str | Path):
@@ -60,19 +61,13 @@ class PolicyWithValue(nn.Module):
 
 
 def logprobs_from_logits(logits, input_ids):
-    """Token log-probs for positions 1..L-1 from logits at 0..L-2. (B, L-1)"""
     return logits_to_token_logprobs(logits, input_ids)
 
 
 def entropy_from_logits(logits, response_mask):
-    """Mean entropy of π(·|s_t) over generated (non-pad) tokens.
-
-    Computed only on masked response positions to avoid a full-batch
-    (B, L, V) softmax on T4.
-    """
-    shift = logits[:, :-1, :]  # (B, L-1, V)
-    # flatten masked positions
-    flat = shift[response_mask.bool()]  # (N, V)
+    """Mean entropy over response tokens only (no full-batch V softmax)."""
+    shift = logits[:, :-1, :]
+    flat = shift[response_mask.bool()]
     if flat.numel() == 0:
         return shift.new_zeros(())
     lp = F.log_softmax(flat.float(), dim=-1)
@@ -80,14 +75,67 @@ def entropy_from_logits(logits, response_mask):
     return ent.mean()
 
 
+def _micro_slices(B: int, micro: int):
+    return [(s, min(s + micro, B)) for s in range(0, B, micro)]
+
+
 @torch.no_grad()
-def rollout(policy, ref, reward_model, tokenizer, prompts_batch, device, beta_kl):
+def policy_logp_and_values(policy, sequences, full_mask, micro: int = 2):
+    """Chunked policy forward → (logp_old, values_old) without huge logits."""
+    B = sequences.shape[0]
+    logps, values = [], []
+    for s, e in _micro_slices(B, micro):
+        logits, vals = policy(sequences[s:e], full_mask[s:e])
+        logps.append(logprobs_from_logits(logits, sequences[s:e]))
+        values.append(vals[:, :-1])
+        del logits, vals
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return torch.cat(logps, 0), torch.cat(values, 0)
+
+
+@torch.no_grad()
+def ref_logprobs(ref, sequences, full_mask, micro: int = 2):
+    B = sequences.shape[0]
+    logps = []
+    for s, e in _micro_slices(B, micro):
+        out = ref(input_ids=sequences[s:e], attention_mask=full_mask[s:e])
+        logps.append(logprobs_from_logits(out.logits, sequences[s:e]))
+        del out
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return torch.cat(logps, 0)
+
+
+@torch.no_grad()
+def reward_scores(reward_model, sequences, full_mask, micro: int = 4):
+    B = sequences.shape[0]
+    scores = []
+    for s, e in _micro_slices(B, micro):
+        scores.append(reward_model(sequences[s:e], full_mask[s:e]))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return torch.cat(scores, 0)
+
+
+@torch.no_grad()
+def rollout(
+    policy,
+    ref,
+    reward_model,
+    tokenizer,
+    prompts_batch,
+    device,
+    beta_kl,
+    forward_micro: int = 2,
+    gen_chunk: int = 4,
+):
     """Sample summaries and store old logprobs / values / rewards (no grads)."""
     policy.eval()
     input_ids = prompts_batch["input_ids"].to(device)
     attention_mask = prompts_batch["attention_mask"].to(device)
 
-    sequences, prompt_len, full_mask = generate_summaries(
+    sequences, prompt_len, full_mask = generate_summaries_chunked(
         policy.lm,
         tokenizer,
         input_ids,
@@ -97,54 +145,32 @@ def rollout(policy, ref, reward_model, tokenizer, prompts_batch, device, beta_kl
         temperature=1.0,
         top_k=0,
         top_p=1.0,
+        chunk_size=gen_chunk,
     )
 
-    # response mask over (L-1) positions: 1 where the *predicted token*
-    # (index j+1) is a generated summary token (and real, not post-EOS pad)
     B, full_L = sequences.shape
     positions = torch.arange(full_L - 1, device=device).unsqueeze(0).expand(B, -1)
     token_idx = positions + 1
-    response_mask = (
-        (token_idx >= prompt_len) & (full_mask[:, 1:] == 1)
-    ).long()
+    response_mask = ((token_idx >= prompt_len) & (full_mask[:, 1:] == 1)).long()
 
-    # Forward policy (old) and ref
-    logits_old, values_all = policy(sequences, full_mask)
-    # V(s_t) from the position whose logits predict a_t, i.e. index of a_t - 1
-    # values_all[:, j] is V at position j; for action at token index j+1,
-    # we want values_all[:, j]  → values for (L-1) actions: values_all[:, :-1]
-    values_old = values_all[:, :-1]
+    logp_old, values_old = policy_logp_and_values(
+        policy, sequences, full_mask, micro=forward_micro
+    )
+    logp_ref = ref_logprobs(ref, sequences, full_mask, micro=forward_micro)
+    r_phi = reward_scores(reward_model, sequences, full_mask, micro=4)
 
-    logp_old = logprobs_from_logits(logits_old, sequences)
-
-    ref_out = ref(input_ids=sequences, attention_mask=full_mask)
-    logp_ref = logprobs_from_logits(ref_out.logits, sequences)
-
-    # Reward-model score for each full prompt+summary
-    # Truncate each sequence to real tokens only for RM (use full_mask)
-    r_phi = reward_model(sequences, full_mask)  # (B,)
-
-    # Per-token reward:
-    # r_t = -β_KL (log π_old - log π_ref) + 1[t=T] r_φ
-    kl_token = logp_old - logp_ref  # (B, L-1)
+    kl_token = logp_old - logp_ref
     rewards = -beta_kl * kl_token
 
-    # add r_φ at the last generated token of each sequence
-    # last generated token index in the (L-1) timeline:
-    # number of response tokens = response_mask.sum(dim=1)
     resp_lens = response_mask.sum(dim=1)
     for i in range(B):
         if resp_lens[i] == 0:
             continue
-        # index in (L-1) of last response token
-        # tokens at indices prompt_len .. end-1; last one's (L-1)-index =
-        # last real token index - 1
         last_token_idx = int((full_mask[i] == 1).nonzero(as_tuple=False)[-1].item())
-        last_action_pos = last_token_idx - 1  # position in (L-1)
+        last_action_pos = last_token_idx - 1
         if last_action_pos >= 0:
             rewards[i, last_action_pos] = rewards[i, last_action_pos] + r_phi[i]
 
-    # Returns with γ=1: R_t = sum_{k>=0} r_{t+k}  (only over response region)
     returns = torch.zeros_like(rewards)
     for i in range(B):
         running = 0.0
@@ -152,23 +178,21 @@ def rollout(policy, ref, reward_model, tokenizer, prompts_batch, device, beta_kl
             if response_mask[i, t] == 1:
                 running = rewards[i, t].item() + running
                 returns[i, t] = running
-            else:
-                # outside response: leave 0; reset not needed since we only use masked
-                pass
 
     advantages = returns - values_old
-    # normalise advantages over all generated tokens in the batch
     adv_flat = advantages[response_mask.bool()]
     if adv_flat.numel() > 1:
         adv_mean = adv_flat.mean()
         adv_std = adv_flat.std().clamp_min(1e-8)
         advantages = (advantages - adv_mean) / adv_std
 
-    # KL per sequence (sum over summary tokens), then mean over batch
     kl_per_seq = (kl_token * response_mask.float()).sum(dim=-1)
     mean_kl = kl_per_seq.mean().item()
     mean_r = r_phi.mean().item()
     mean_len = resp_lens.float().mean().item()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return {
         "sequences": sequences,
@@ -184,9 +208,8 @@ def rollout(policy, ref, reward_model, tokenizer, prompts_batch, device, beta_kl
     }
 
 
-def ppo_update(policy, optimizer, roll, eps, c_v, c_h, device, micro_batches=2):
-    """K-epoch caller will call this once per epoch. Process rollout in halves
-    if needed to save memory."""
+def ppo_update(policy, optimizer, roll, eps, c_v, c_h, device, micro_batches=8):
+    """One PPO epoch; process rollout in small micro-batches for T4."""
     sequences = roll["sequences"]
     full_mask = roll["full_mask"]
     response_mask = roll["response_mask"]
@@ -195,17 +218,15 @@ def ppo_update(policy, optimizer, roll, eps, c_v, c_h, device, micro_batches=2):
     advantages = roll["advantages"]
 
     B = sequences.shape[0]
-    # split into micro-batches
-    idxs = list(range(B))
     chunk = max(1, math.ceil(B / micro_batches))
-    chunks = [idxs[i : i + chunk] for i in range(0, B, chunk)]
+    chunks = [list(range(i, min(i + chunk, B))) for i in range(0, B, chunk)]
 
     optimizer.zero_grad(set_to_none=True)
     total_pg = total_vf = total_ent = 0.0
     clip_hits = clip_total = 0
     ratio_first = []
 
-    for ci, chunk_idx in enumerate(chunks):
+    for chunk_idx in chunks:
         idx = torch.tensor(chunk_idx, device=device, dtype=torch.long)
         seq = sequences.index_select(0, idx)
         mask = full_mask.index_select(0, idx)
@@ -224,13 +245,11 @@ def ppo_update(policy, optimizer, roll, eps, c_v, c_h, device, micro_batches=2):
         unclipped = ratio * adv
         clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * adv
         pg = torch.min(unclipped, clipped)
-        # maximise pg → minimise -pg
         L_ppo = masked_mean(pg, resp)
         L_v = masked_mean((values - ret) ** 2, resp)
         H = entropy_from_logits(logits, resp)
 
         loss = -L_ppo + c_v * L_v - c_h * H
-        # scale by chunk fraction so sum of grads ≈ full-batch grad
         (loss * (len(chunk_idx) / B)).backward()
 
         total_pg += L_ppo.item() * len(chunk_idx)
@@ -240,6 +259,10 @@ def ppo_update(policy, optimizer, roll, eps, c_v, c_h, device, micro_batches=2):
         outside = ((ratio < 1.0 - eps) | (ratio > 1.0 + eps)) & resp.bool()
         clip_hits += outside.sum().item()
         clip_total += resp.sum().item()
+
+        del logits, values_all, logp, values, ratio, unclipped, clipped, pg, loss
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
     optimizer.step()
@@ -262,21 +285,24 @@ def train(args):
 
     tokenizer = load_tokenizer()
     sft_train, _ = load_sft_splits(tokenizer)
-    # prompts only for rollouts
     prompt_loader = DataLoader(
         sft_train,
         batch_size=args.prompts_per_rollout,
-        sampler=RandomSampler(sft_train, replacement=True, num_samples=args.iterations * args.prompts_per_rollout),
+        sampler=RandomSampler(
+            sft_train,
+            replacement=True,
+            num_samples=args.iterations * args.prompts_per_rollout,
+        ),
         collate_fn=partial(collate_prompts, pad_id=tokenizer.pad_token_id),
     )
 
     print("Loading policy (+value), reference, reward…")
     policy = PolicyWithValue(args.sft_path, device=device)
-    ref = freeze_model(load_causal_lm(args.sft_path, device=device))
+    ref = freeze_model(load_causal_lm(args.sft_path, device=device, dtype=torch.float16))
     reward_model = RewardModel.load(args.sft_path, args.reward_path, device=device)
     freeze_model(reward_model)
+    reward_model.half()
 
-    # Correctness: frozen params
     assert all(not p.requires_grad for p in ref.parameters())
     assert all(not p.requires_grad for p in reward_model.parameters())
     print("Frozen check OK: π_ref and r_φ have requires_grad=False")
@@ -297,7 +323,7 @@ def train(args):
     t0 = time.time()
     prompt_iter = iter(prompt_loader)
 
-    for it in range(1, args.iterations + 1):
+    for it in range(args.start_iter, args.iterations + 1):
         prompts_batch = next(prompt_iter)
         with torch.no_grad():
             roll = rollout(
@@ -308,9 +334,10 @@ def train(args):
                 prompts_batch,
                 device,
                 args.beta_kl,
+                forward_micro=args.forward_micro,
+                gen_chunk=args.gen_chunk,
             )
 
-        # Correctness first iteration: KL ≈ 0
         if it == 1:
             print(f"PPO iter 1 KL to ref (expect ~0): {roll['mean_kl']:.6f}")
 
@@ -351,9 +378,17 @@ def train(args):
             f"Lppo={last_stats['L_ppo']:.3f} Lv={last_stats['L_v']:.3f} H={last_stats['H']:.3f}"
         )
 
+        del roll
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         if it % 20 == 0:
             with open(results_dir / "ppo_log.json", "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
+            # intermediate policy save (helps after Colab disconnect)
+            policy.save_policy(args.out_dir)
+            tokenizer.save_pretrained(args.out_dir)
+            print(f"  checkpoint saved at iter {it} → {args.out_dir}")
 
     elapsed = time.time() - t0
     out = Path(args.out_dir)
@@ -364,7 +399,6 @@ def train(args):
     with open(results_dir / "ppo_log.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    # Figure 3
     fig, axes = plt.subplots(2, 2, figsize=(10, 7))
     axes[0, 0].plot(history["iter"], history["mean_r"])
     axes[0, 0].set_title("mean rφ")
@@ -397,7 +431,10 @@ def parse_args():
     p.add_argument("--ppo_epochs", type=int, default=4)
     p.add_argument("--prompts_per_rollout", type=int, default=16)
     p.add_argument("--iterations", type=int, default=200)
-    p.add_argument("--micro_batches", type=int, default=2)
+    p.add_argument("--start_iter", type=int, default=1)
+    p.add_argument("--micro_batches", type=int, default=8)
+    p.add_argument("--forward_micro", type=int, default=2)
+    p.add_argument("--gen_chunk", type=int, default=4)
     return p.parse_args()
 
 
