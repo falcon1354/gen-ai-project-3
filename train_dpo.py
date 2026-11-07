@@ -53,10 +53,31 @@ def val_implicit_acc(policy, ref, loader, beta, device, micro_batch_size: int):
             mb = slice_batch(batch, start, start + micro_batch_size)
             _, acc = dpo_loss(policy, ref, mb, beta, device)
             bs = mb["chosen_ids"].shape[0]
-            correct += (acc.item() * bs)
+            correct += acc.item() * bs
             total += bs
     policy.train()
     return correct / max(total, 1)
+
+
+def _state_path(out_dir: Path) -> Path:
+    return out_dir / "train_state.pt"
+
+
+def save_checkpoint(out_dir: Path, policy, tokenizer, optimizer, scaler, step, log, elapsed):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    policy.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir)
+    torch.save(
+        {
+            "step": step,
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "log": log,
+            "elapsed": elapsed,
+        },
+        _state_path(out_dir),
+    )
+    print(f"  checkpoint saved at step {step} → {out_dir}")
 
 
 def train(args):
@@ -64,6 +85,8 @@ def train(args):
     device = get_device()
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
     assert args.batch_size % args.micro_batch_size == 0
     accum_steps = args.batch_size // args.micro_batch_size
@@ -76,13 +99,20 @@ def train(args):
     print("Loading preference data…")
     pref_train, pref_val = load_preference_splits(tokenizer)
 
-    train_loader = DataLoader(
-        pref_train,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=partial(collate_pref, pad_id=tokenizer.pad_token_id),
-        drop_last=True,
-    )
+    # Fixed generator so resume can skip the same prefix of shuffled batches
+    g = torch.Generator()
+    g.manual_seed(SEED)
+
+    def make_train_loader():
+        return DataLoader(
+            pref_train,
+            batch_size=args.batch_size,
+            shuffle=True,
+            generator=g,
+            collate_fn=partial(collate_pref, pad_id=tokenizer.pad_token_id),
+            drop_last=True,
+        )
+
     val_loader = DataLoader(
         pref_val,
         batch_size=args.batch_size,
@@ -90,12 +120,23 @@ def train(args):
         collate_fn=partial(collate_pref, pad_id=tokenizer.pad_token_id),
     )
 
-    print(f"Loading policy + frozen ref from {args.sft_path}…")
-    policy = load_causal_lm(args.sft_path, device=device)
+    resume_state = _state_path(out)
+    resuming = args.resume and resume_state.exists()
+
+    if resuming:
+        print(f"Resuming DPO from {out} …")
+        policy = load_causal_lm(str(out), device=device)
+        start_step = 0
+    else:
+        print(f"Loading policy + frozen ref from {args.sft_path}…")
+        policy = load_causal_lm(args.sft_path, device=device)
+        start_step = 0
+
     if hasattr(policy, "gradient_checkpointing_enable"):
         policy.gradient_checkpointing_enable()
         if hasattr(policy.config, "use_cache"):
             policy.config.use_cache = False
+
     ref = freeze_model(load_causal_lm(args.sft_path, device=device))
     assert all(not p.requires_grad for p in ref.parameters())
     print("Frozen check OK: π_ref requires_grad=False")
@@ -105,29 +146,48 @@ def train(args):
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # Correctness: first step loss ≈ log 2 (use tiny micro-batch)
-    first_batch = slice_batch(next(iter(train_loader)), 0, min(2, args.micro_batch_size))
-    with torch.no_grad():
-        loss0, _ = dpo_loss(policy, ref, first_batch, args.beta, device)
-    print(f"DPO first-step loss (expect ≈ log 2 = 0.6931): {loss0.item():.4f}")
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
     log = {"step": [], "train_loss": [], "val_acc": []}
+    elapsed_prev = 0.0
+
+    if resuming:
+        state = torch.load(resume_state, map_location="cpu")
+        optimizer.load_state_dict(state["optimizer"])
+        if "scaler" in state and use_amp:
+            scaler.load_state_dict(state["scaler"])
+        start_step = int(state["step"])
+        log = state.get("log", log)
+        elapsed_prev = float(state.get("elapsed", 0.0))
+        print(f"Resumed at step {start_step}")
+    else:
+        # Correctness: first step loss ≈ log 2
+        first_batch = slice_batch(
+            next(iter(make_train_loader())), 0, min(2, args.micro_batch_size)
+        )
+        # reset generator after peek
+        g.manual_seed(SEED)
+        with torch.no_grad():
+            loss0, _ = dpo_loss(policy, ref, first_batch, args.beta, device)
+        print(f"DPO first-step loss (expect ≈ log 2 = 0.6931): {loss0.item():.4f}")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    steps_per_epoch = len(pref_train) // args.batch_size
+    total_steps = steps_per_epoch * args.epochs
+    print(f"Total steps this run: {total_steps} (resume from {start_step})")
+
     step = 0
     t0 = time.time()
     running, running_n = 0.0, 0
 
-    train_loader = DataLoader(
-        pref_train,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=partial(collate_pref, pad_id=tokenizer.pad_token_id),
-        drop_last=True,
-    )
-
     for epoch in range(args.epochs):
+        # re-seed each epoch start so epoch 0 order is reproducible on resume
+        g.manual_seed(SEED + epoch)
+        train_loader = make_train_loader()
         for batch in train_loader:
+            step += 1
+            if step <= start_step:
+                continue
+
             optimizer.zero_grad(set_to_none=True)
             B = batch["chosen_ids"].shape[0]
             loss_accum = 0.0
@@ -137,19 +197,18 @@ def train(args):
                     loss, _ = dpo_loss(policy, ref, mb, args.beta, device)
                     loss = loss / accum_steps
                 scaler.scale(loss).backward()
-                loss_accum += loss.item() * accum_steps
+                loss_accum += float(loss.detach()) * accum_steps
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
 
-            step += 1
             running += loss_accum
             running_n += 1
 
             if step % args.log_every == 0:
-                train_l = running / running_n
+                train_l = running / max(running_n, 1)
                 acc = val_implicit_acc(
                     policy, ref, val_loader, args.beta, device, args.micro_batch_size
                 )
@@ -161,20 +220,27 @@ def train(args):
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
+            if step % args.save_every == 0:
+                elapsed = elapsed_prev + (time.time() - t0)
+                save_checkpoint(
+                    out, policy, tokenizer, optimizer, scaler, step, log, elapsed
+                )
+                with open(results_dir / "dpo_log.json", "w", encoding="utf-8") as f:
+                    json.dump({**log, "last_step": step, "time_sec": elapsed}, f, indent=2)
+
     final_acc = val_implicit_acc(
         policy, ref, val_loader, args.beta, device, args.micro_batch_size
     )
-    elapsed = time.time() - t0
+    elapsed = elapsed_prev + (time.time() - t0)
     print(f"DPO done. val implicit acc={final_acc:.4f} time={elapsed/60:.1f} min")
 
-    out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    policy.save_pretrained(out)
-    tokenizer.save_pretrained(out)
+    save_checkpoint(out, policy, tokenizer, optimizer, scaler, step, log, elapsed)
 
     with open(results_dir / "dpo_log.json", "w", encoding="utf-8") as f:
         json.dump(
-            {**log, "final_val_acc": final_acc, "time_sec": elapsed}, f, indent=2
+            {**log, "final_val_acc": final_acc, "time_sec": elapsed, "last_step": step},
+            f,
+            indent=2,
         )
 
     if log["step"]:
@@ -203,6 +269,17 @@ def parse_args():
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--log_every", type=int, default=250)
+    p.add_argument(
+        "--save_every",
+        type=int,
+        default=250,
+        help="Save policy + optimizer every N steps (for Colab reconnect)",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from checkpoints/dpo/train_state.pt if present",
+    )
     return p.parse_args()
 
 
